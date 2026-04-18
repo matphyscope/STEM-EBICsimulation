@@ -1,21 +1,22 @@
-"""Load SIMS doping profiles and map them onto the sample grid.
+"""Load SIMS doping profiles and apply them to the 2-D sample grid.
 
-SIMS CSV layout::
+Each SIMS file is a 1-D trace of concentration vs depth.  The user
+decides where that surface (depth = 0) lies in the sample coordinate
+system by specifying
 
-    X, Y
-    depth[nm], concentration[cm^-3]
+* ``axis``   : "x" or "y"  - the axis on which the surface line lies
+* ``pos_nm`` : position on ``axis`` where depth = 0
+* ``range_nm``: ``(lo, hi)`` range on the **other** axis where the
+                profile is active
+* ``direction``: "+x"/"-x"/"+y"/"-y" direction of increasing depth
 
-Two profiles are expected - P- and N-type - each giving a 1-D
-concentration vs depth trace anchored at the chosen "surface" in the
-model.  The sign convention:
+With ``axis="x"`` the surface is a vertical line at ``x = pos_nm``.
+Depth extends along ``+x`` or ``-x`` from that line; the profile is
+active for pixels whose ``y`` coordinate falls inside ``range_nm``.
 
-* Positive values in P-type -> acceptors Na
-* Positive values in N-type -> donors Nd
-* net doping N_net = Nd - Na  (positive = n-type, negative = p-type)
-
-The substrate flag forces the deep part of the profile to the supplied
-substrate concentration beyond the point where the SIMS trace drops
-below ``substrate_transition`` of its peak.
+Substrate: the user specifies a substrate type (P or N) + concentration.
+Past the point where the reference profile has decayed below a chosen
+fraction of its peak, the substrate value is forced.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -24,109 +25,162 @@ import pandas as pd
 from scipy.interpolate import interp1d
 
 
+# ---------------------------------------------------------------------------
+# Profile loading
+# ---------------------------------------------------------------------------
 @dataclass
 class SIMSProfile:
-    """A single SIMS trace after reading and cleanup."""
-    depth_nm: np.ndarray       # 1-D, monotonically increasing
-    conc:     np.ndarray       # 1-D, cm^-3
-    kind:     str              # 'P' or 'N'
+    depth_nm: np.ndarray                 # 1-D, monotonically increasing
+    conc:     np.ndarray                 # cm^-3
+    kind:     str                        # 'P' or 'N'
+    unit_x:   str = "nm"
+    unit_y:   str = "cm^-3"
 
     def sample(self, d_nm: np.ndarray) -> np.ndarray:
-        """Linear interpolation with flat extrapolation outside range."""
         f = interp1d(self.depth_nm, self.conc, kind="linear",
                      bounds_error=False,
                      fill_value=(self.conc[0], self.conc[-1]))
-        return np.clip(f(d_nm), 0.0, None)
+        return np.clip(f(np.asarray(d_nm)), 0.0, None)
 
 
 def load_profile(csv_path: str, kind: str) -> SIMSProfile:
+    """Read a 2-column CSV; a second row of units is tolerated."""
     df = pd.read_csv(csv_path)
-    df = df.sort_values(df.columns[0])
+    unit_x, unit_y = "nm", "cm^-3"
+
+    # Check whether the first data row is a units row (non-numeric).
+    try:
+        float(df.iloc[0, 0])
+        float(df.iloc[0, 1])
+    except (TypeError, ValueError):
+        unit_x = str(df.iloc[0, 0])
+        unit_y = str(df.iloc[0, 1])
+        df = df.iloc[1:].reset_index(drop=True)
+
+    df = df.astype(float).sort_values(df.columns[0])
     return SIMSProfile(
-        depth_nm=df.iloc[:, 0].to_numpy(dtype=float),
-        conc    =df.iloc[:, 1].to_numpy(dtype=float),
+        depth_nm=df.iloc[:, 0].to_numpy(),
+        conc    =df.iloc[:, 1].to_numpy(),
         kind    =kind.upper(),
+        unit_x=unit_x, unit_y=unit_y,
     )
 
 
 # ---------------------------------------------------------------------------
-# Distance-from-surface map
+# Placement description
 # ---------------------------------------------------------------------------
-def distance_from_surface(region_mask: np.ndarray, surface_pixels,
-                          nm_per_pixel: float) -> np.ndarray:
-    """Euclidean distance (nm) from each sample pixel to the nearest
-    listed ``surface_pixels`` entry.  Pixels outside the sample get NaN.
-    """
-    from scipy.ndimage import distance_transform_edt
+@dataclass
+class ProfilePlacement:
+    profile: SIMSProfile
+    axis: str                            # 'x' or 'y' - axis on which surface lies
+    pos_nm: float                        # position on that axis
+    range_nm: tuple[float, float]        # (lo, hi) on the OTHER axis
+    direction: str                       # '+x', '-x', '+y', '-y'
 
-    seed = np.ones_like(region_mask, dtype=bool)
-    for (r, c) in surface_pixels:
-        seed[r, c] = False
-    dist_px = distance_transform_edt(seed)
-    dist_nm = dist_px * nm_per_pixel
-    dist_nm[region_mask == 0] = np.nan
-    return dist_nm
+    def depth_map(self, X_nm: np.ndarray, Y_nm: np.ndarray) -> np.ndarray:
+        """Return a depth (nm) at every grid point, or NaN outside the
+        band where the profile is active."""
+        depth = np.full_like(X_nm, np.nan)
+        lo, hi = self.range_nm
+        if self.direction == "+x":
+            d = X_nm - self.pos_nm
+            active = (d >= 0) & (Y_nm >= lo) & (Y_nm <= hi)
+        elif self.direction == "-x":
+            d = self.pos_nm - X_nm
+            active = (d >= 0) & (Y_nm >= lo) & (Y_nm <= hi)
+        elif self.direction == "+y":
+            d = Y_nm - self.pos_nm
+            active = (d >= 0) & (X_nm >= lo) & (X_nm <= hi)
+        elif self.direction == "-y":
+            d = self.pos_nm - Y_nm
+            active = (d >= 0) & (X_nm >= lo) & (X_nm <= hi)
+        else:
+            raise ValueError(f"bad direction {self.direction!r}")
+        depth[active] = d[active]
+        return depth
 
 
-def _substrate_boundary_nm(profile: SIMSProfile,
-                            substrate_transition: float = 0.1) -> float:
-    """Depth at which the profile has decayed past the peak below the
-    transition fraction.  We search **after** the peak so that a leading
-    zero region (no doping near the surface) does not trigger the
-    substrate prematurely."""
+# ---------------------------------------------------------------------------
+# Apply placements to a sample grid
+# ---------------------------------------------------------------------------
+def _post_peak_decay_point(profile: SIMSProfile, frac: float) -> float:
     peak_idx = int(profile.conc.argmax())
     peak = profile.conc[peak_idx]
     if peak <= 0:
         return float(profile.depth_nm[-1])
-    thresh = peak * substrate_transition
     tail = profile.conc[peak_idx:]
-    idx = np.where(tail < thresh)[0]
-    if idx.size == 0:
+    dropped = np.where(tail < peak * frac)[0]
+    if dropped.size == 0:
         return float(profile.depth_nm[-1])
-    return float(profile.depth_nm[peak_idx + idx[0]])
+    return float(profile.depth_nm[peak_idx + dropped[0]])
 
 
-# ---------------------------------------------------------------------------
-# Net doping map
-# ---------------------------------------------------------------------------
-def apply_sims_to_region(distance_nm: np.ndarray,
-                         region_mask: np.ndarray,
-                         region_id: int,
-                         p_profile: SIMSProfile | None,
-                         n_profile: SIMSProfile | None,
-                         substrate_type: str | None = None,
-                         substrate_conc: float = 0.0,
-                         substrate_transition: float = 0.1
-                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (Na, Nd, net_doping) arrays for all pixels in the region.
+def build_doping_maps(model, placements: list[ProfilePlacement],
+                       sims_region_ids: list[int],
+                       substrate_type: str | None = None,
+                       substrate_conc: float = 0.0,
+                       substrate_transition: float = 0.1):
+    """Return ``(Na, Nd, Nnet)`` 2-D maps over the whole image.
 
-    Outside the region the values are NaN so downstream code can mask
-    metallic/insulator areas.  Substrate handling: past the point where
-    the shallowest SIMS trace has decayed below the transition
-    fraction, the specified substrate concentration is enforced.
+    Parameters
+    ----------
+    model : SampleModel
+    placements : list of :class:`ProfilePlacement`
+    sims_region_ids : list of region ids that receive SIMS doping.
+        Pixels outside these regions stay at NaN so later code can
+        mask metal/insulator regions.
+    substrate_type, substrate_conc : as per the spec - past the decay
+        point of *each* placement the substrate doping is forced.
+
+    **Sign convention** (requested by the user): the returned
+    ``Nnet`` equals ``Nd - Na``, so N-type appears positive and
+    P-type negative.
     """
-    shape = region_mask.shape
-    Na = np.full(shape, np.nan)
-    Nd = np.full(shape, np.nan)
+    H, W = model.shape
+    X, Y = model.xy_grids_nm()
+    inside = np.isin(model.region_mask, list(sims_region_ids))
 
-    in_region = region_mask == region_id
-    d = distance_nm[in_region]
+    Na = np.zeros((H, W))
+    Nd = np.zeros((H, W))
 
-    na = p_profile.sample(d) if p_profile is not None else np.zeros_like(d)
-    nd = n_profile.sample(d) if n_profile is not None else np.zeros_like(d)
+    for pl in placements:
+        depth = pl.depth_map(X, Y)
+        active = np.isfinite(depth) & inside
+        if not active.any():
+            continue
+        d_vals = depth[active]
+        c_vals = pl.profile.sample(d_vals)
 
-    if substrate_type is not None and substrate_conc > 0:
-        # where substrate dominates
-        ref = p_profile or n_profile
-        transition = _substrate_boundary_nm(ref, substrate_transition)
-        sub_mask = d >= transition
-        if substrate_type.lower().startswith("n"):
-            nd = np.where(sub_mask, substrate_conc, nd)
-            na = np.where(sub_mask, 0.0, na)
+        # apply substrate past the decay of this specific profile
+        if substrate_type is not None and substrate_conc > 0:
+            cutoff = _post_peak_decay_point(pl.profile, substrate_transition)
+            deep = d_vals >= cutoff
+            if substrate_type.upper().startswith("N"):
+                sub_nd = np.where(deep, substrate_conc, 0.0)
+                sub_na = np.zeros_like(sub_nd)
+            else:
+                sub_na = np.where(deep, substrate_conc, 0.0)
+                sub_nd = np.zeros_like(sub_na)
+
+            if pl.profile.kind == "P":
+                target_na = np.where(deep, sub_na, c_vals)
+                target_nd = np.where(deep, sub_nd, 0.0)
+            else:
+                target_nd = np.where(deep, sub_nd, c_vals)
+                target_na = np.where(deep, sub_na, 0.0)
         else:
-            na = np.where(sub_mask, substrate_conc, na)
-            nd = np.where(sub_mask, 0.0, nd)
+            if pl.profile.kind == "P":
+                target_na, target_nd = c_vals, np.zeros_like(c_vals)
+            else:
+                target_na, target_nd = np.zeros_like(c_vals), c_vals
 
-    Na[in_region] = na
-    Nd[in_region] = nd
-    return Na, Nd, Nd - Na
+        Na[active] += target_na
+        Nd[active] += target_nd
+
+    # NaN outside any SIMS region so downstream physics can mask them
+    mask = ~inside
+    Na[mask] = np.nan
+    Nd[mask] = np.nan
+
+    Nnet = Nd - Na           # N positive, P negative
+    return Na, Nd, Nnet
