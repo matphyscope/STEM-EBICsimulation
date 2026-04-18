@@ -26,26 +26,69 @@ from sklearn.cluster import KMeans
 # ---------------------------------------------------------------------------
 # Scale-bar detection (separate image)
 # ---------------------------------------------------------------------------
-def detect_scale_from_image(scalebar_path: str, bar_length_um: float = 10.0,
-                             darkness: int = 80) -> float:
-    """Return nm / pixel using the length of the dark bar in the image.
+def _load_rgb_on_white(path: str) -> np.ndarray:
+    """Load an image and flatten any transparency onto a white background
+    so that "empty" areas are bright rather than black."""
+    im = Image.open(path)
+    if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        bg.alpha_composite(im.convert("RGBA"))
+        im = bg.convert("RGB")
+    else:
+        im = im.convert("RGB")
+    return np.asarray(im)
 
-    The heuristic looks for the longest consecutive run of dark
-    pixels in any row of the image.  That run is assumed to be the
-    scale bar of length ``bar_length_um`` (default 10 um).
-    """
-    gray = np.asarray(Image.open(scalebar_path).convert("L"))
+
+def _scale_bar_from_gray(gray: np.ndarray, darkness: int = 80,
+                          min_bar_len: int = 20,
+                          max_fraction: float = 0.8) -> int | None:
+    """Find the pixel length of the longest *isolated* dark horizontal
+    run in a grayscale image.  Runs that span more than ``max_fraction``
+    of the image width are rejected (they are almost certainly a
+    border).  Returns ``None`` if no plausible bar is found."""
+    h, w = gray.shape
     mask = gray < darkness
-    best = 0
+    longest = 0
     for row in mask:
         if not row.any():
             continue
         idx = np.flatnonzero(row)
         runs = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
-        best = max(best, max(len(r) for r in runs))
-    if best < 5:
-        raise ValueError("Could not find a scale bar in the image")
-    return bar_length_um * 1000.0 / best         # nm per pixel
+        for r in runs:
+            L = len(r)
+            if L < min_bar_len or L > max_fraction * w:
+                continue
+            if L > longest:
+                longest = L
+    return longest if longest >= min_bar_len else None
+
+
+def detect_scale_from_image(scalebar_path: str, bar_length_um: float = 10.0,
+                             darkness: int = 80) -> float:
+    """Return nm / pixel from a *separate* scale-bar image."""
+    gray = np.asarray(Image.open(scalebar_path).convert("L"))
+    px = _scale_bar_from_gray(gray, darkness=darkness, max_fraction=0.95)
+    if px is None:
+        raise ValueError(f"No scale bar found in {scalebar_path!r}")
+    return bar_length_um * 1000.0 / px
+
+
+def detect_scale_from_main_image(image_path: str,
+                                   bar_length_um: float = 10.0,
+                                   darkness: int = 80) -> float:
+    """Return nm / pixel by locating a scale bar inside the main image.
+
+    Transparent pixels (alpha = 0) are treated as white so any region
+    outside the sample is bright.  We then look for the longest
+    isolated dark horizontal run that is at most 80 % of the image
+    width (to avoid the sample's own border).
+    """
+    rgb = _load_rgb_on_white(image_path)
+    gray = np.asarray(Image.fromarray(rgb).convert("L"))
+    px = _scale_bar_from_gray(gray, darkness=darkness, max_fraction=0.8)
+    if px is None:
+        raise ValueError(f"No scale bar found inside {image_path!r}")
+    return bar_length_um * 1000.0 / px
 
 
 # ---------------------------------------------------------------------------
@@ -176,23 +219,38 @@ class SampleModel:
 # ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
-def build_model(image_path: str, scalebar_path: str,
-                n_clusters: int,
+def build_model(image_path: str,
+                scalebar_path: str | None = None,
+                n_clusters: int = 1,
                 thickness_nm: float = 100.0,
-                bar_length_um: float = 10.0) -> SampleModel:
-    """Load an image + scale bar and return a :class:`SampleModel`.
+                bar_length_um: float = 10.0,
+                nm_per_pixel: float | None = None) -> SampleModel:
+    """Load an image and return a :class:`SampleModel`.
 
-    The caller completes the model by calling
-    ``assign_clusters_to_regions`` and ``set_material`` (or passing
-    ``SampleModel(...).materials = {...}``).
+    Parameters
+    ----------
+    image_path : str
+        Path to the image containing the sample (and possibly a
+        scale bar).
+    scalebar_path : str, optional
+        Path to a *separate* scale-bar image.  If not given the scale
+        is detected from ``image_path`` itself.
+    nm_per_pixel : float, optional
+        Explicit override (skip auto-detection).
     """
-    img = np.asarray(Image.open(image_path).convert("RGB"))
-    nm_per_pixel = detect_scale_from_image(scalebar_path, bar_length_um)
+    img = _load_rgb_on_white(image_path)
+    if nm_per_pixel is None:
+        if scalebar_path is not None:
+            nm_per_pixel = detect_scale_from_image(scalebar_path,
+                                                    bar_length_um)
+        else:
+            nm_per_pixel = detect_scale_from_main_image(image_path,
+                                                         bar_length_um)
     cluster_mask = cluster_image(img, n_clusters=n_clusters)
     return SampleModel(
         image=img,
         cluster_mask=cluster_mask,
-        region_mask=cluster_mask.copy(),   # default 1:1 mapping
+        region_mask=cluster_mask.copy(),
         nm_per_pixel=float(nm_per_pixel),
         thickness_nm=float(thickness_nm),
     )

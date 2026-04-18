@@ -91,8 +91,9 @@ def extract_slice_along_placement(model, Na_map, Nd_map, eps_r_map,
         return Slice1D(x_nm=np.array([0.0]), Na=np.array([0.0]),
                         Nd=np.array([0.0]), Nnet=np.array([0.0]),
                         eps_r=np.array([C.EPS_R_SI]))
+    # coord is kept in the same reference as the placement depth (distance
+    # from the surface), so 2-D extrusion can interpolate directly.
     coord = coord[good]; Na = Na[good]; Nd = Nd[good]; eps = eps[good]
-    coord = coord - coord.min()
     return Slice1D(x_nm=coord, Na=Na, Nd=Nd,
                     Nnet=Nd - Na, eps_r=eps)
 
@@ -159,6 +160,7 @@ def electric_field_1d(sl: Slice1D, depletion: dict) -> dict:
     x = sl.x_nm * 1e-7
     eps = sl.eps_r * C.eps0 * 1e-2
     rho = np.zeros_like(sl.Nnet)
+    in_dep = np.zeros_like(sl.Nnet, dtype=bool)
     for j in depletion["junctions"]:
         idx = j["index"]
         xj = x[idx]
@@ -168,7 +170,12 @@ def electric_field_1d(sl: Slice1D, depletion: dict) -> dict:
         right = (x >= xj) & (x <= xj + wr)
         rho[left]  += j["left_sign"]  * C.q * j["N_left"]
         rho[right] += j["right_sign"] * C.q * j["N_right"]
+        in_dep |= left | right
     E = cumulative_trapezoid(rho / eps, x, initial=0.0)
+    # Depletion approximation: E is identically zero in the charge-neutral
+    # regions.  Force this so tiny numerical accumulation errors don't
+    # show up as spurious fields outside the junctions.
+    E[~in_dep] = 0.0
     V = -cumulative_trapezoid(E, x, initial=0.0)
     return dict(E_Vcm=E, V_V=V, rho_Ccm3=rho)
 

@@ -96,17 +96,74 @@ def plot_efield_1d(sl, ef, dep):
     return fig
 
 
-def plot_efield_2d(model, fields):
+def plot_efield_2d(model, fields, n_arrows_across_dep: int = 6,
+                    n_arrows_along: int = 8):
+    """|E| colour map overlaid with direction arrows drawn densely
+    inside the depletion region(s).
+
+    Arrow spacing auto-adapts to the depletion width so the field
+    direction is visible even when the depletion is only a few tens
+    of nanometres wide.
+    """
     fig, ax = plt.subplots(figsize=(5, 8))
     im = ax.imshow(fields["E_Vcm"] / 1e3, extent=model.extent_nm,
                     cmap="magma")
     plt.colorbar(im, ax=ax, label="|E| (kV/cm)")
+
+    Ex = fields["Ex"]; Ey = fields["Ey"]
+    dep = fields["dep_mask"]
+    H, W = Ex.shape
+    px = model.nm_per_pixel
+
+    # build a short list of arrows by scanning columns / rows
+    # covering the depletion mask densely.  Arrows are drawn as unit
+    # vectors (direction only) so they stay legible regardless of the
+    # absolute field magnitude.
+    if dep.any():
+        ys, xs = np.where(dep)
+        y_lo, y_hi = ys.min(), ys.max()
+        x_lo, x_hi = xs.min(), xs.max()
+        sy = max(1, (y_hi - y_lo) // max(n_arrows_across_dep, 1))
+        sx = max(1, (x_hi - x_lo) // max(n_arrows_along, 1))
+        YY, XX = np.mgrid[y_lo:y_hi + 1:sy, x_lo:x_hi + 1:sx]
+        U = Ex[YY, XX].astype(float)
+        V = Ey[YY, XX].astype(float)
+        mag = np.hypot(U, V)
+        m = mag > 0
+        if m.any():
+            Un = U[m] / mag[m]
+            Vn = V[m] / mag[m]
+            ax.quiver(XX[m] * px, YY[m] * px, Un, Vn,
+                       color="cyan", pivot="mid",
+                       angles="xy", scale=25, scale_units="width",
+                       width=0.005, headwidth=4, headlength=5)
+
     for j in fields["junctions"]:
         if j["axis"] == "x":
-            ax.axvline(j["pos"], color="cyan", lw=0.8, alpha=0.6)
+            ax.axvline(j["pos"], color="white", lw=0.6, alpha=0.6)
         else:
-            ax.axhline(j["pos"], color="cyan", lw=0.8, alpha=0.6)
-    ax.set_title("Electric field (2-D)")
+            ax.axhline(j["pos"], color="white", lw=0.6, alpha=0.6)
+    ax.set_title("Electric field (|E| + direction)")
+    ax.set_xlabel("x (nm)"); ax.set_ylabel("y (nm)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_efield_streamlines(model, fields):
+    """Streamline plot of the E vector field (direction only, coloured
+    by |E|).  Complements :func:`plot_efield_2d` when arrow density
+    makes quiver plots cluttered."""
+    fig, ax = plt.subplots(figsize=(5, 8))
+    H, W = fields["Ex"].shape
+    px = model.nm_per_pixel
+    x = (np.arange(W) + 0.5) * px
+    y = (np.arange(H) + 0.5) * px
+    strm = ax.streamplot(x, y, fields["Ex"], fields["Ey"],
+                          color=fields["E_Vcm"] / 1e3,
+                          cmap="magma", density=1.2, linewidth=1.0)
+    plt.colorbar(strm.lines, ax=ax, label="|E| (kV/cm)")
+    ax.set_xlim(0, W * px); ax.set_ylim(H * px, 0)
+    ax.set_title("Electric field streamlines")
     ax.set_xlabel("x (nm)"); ax.set_ylabel("y (nm)")
     fig.tight_layout()
     return fig
