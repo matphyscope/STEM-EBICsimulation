@@ -1,24 +1,19 @@
 """STEM-EBIC simulation package.
 
-Modules
--------
-materials   : Material table + Arora/BGN/work-function physics
-image_model : Build 2D model from an image (regions + scale bar)
-sims        : Load SIMS P/N profiles and map onto the grid
-circuit     : Electrical contacts and contact-type classification
-physics     : Device physics - integration-based E-field, depletion,
-              Kanaya-Okayama generation volume, collection probability,
-              EBIC and SEEBIC
-visualization : All plotting helpers
+Public modules
+--------------
+materials     - CSV loader + Arora / BGN / work-function physics
+image_model   - Build a 2-D sample model from an image + scale bar
+sims          - SIMS profile loader + axis-based placement
+beam          - User-defined electron-beam condition (keV, n electrons)
+circuit       - Electrical contacts, ohmic/Schottky classification
+physics       - Depletion, E-field, collection probability,
+                2-D EBIC / SEEBIC scans
+visualization - Plotting + numerical dump helpers
 """
 
-from . import materials, image_model, sims, circuit, physics, visualization
+from . import (materials, image_model, sims, beam, circuit, physics,
+                visualization)
 
-__all__ = [
-    "materials",
-    "image_model",
-    "sims",
-    "circuit",
-    "physics",
-    "visualization",
-]
+__all__ = ["materials", "image_model", "sims", "beam", "circuit",
+            "physics", "visualization"]

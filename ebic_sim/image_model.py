@@ -1,17 +1,20 @@
-"""Build a 2-D TEM-sample model from an image.
+"""Build a 2-D sample model from an image + separate scale-bar image.
 
-Responsibilities
-----------------
-* Read the image and optionally auto-detect the scale bar to obtain a
-  pixel->nm conversion.  When detection fails the caller can pass the
-  scale explicitly.
-* Segment the sample into labelled regions via colour clustering.  The
-  background (white/near-white) is dropped.
-* Let the user map region labels to material names.  The special token
-  ``"SIMS"`` means "this region is semiconductor whose doping comes from
-  the SIMS file(s) supplied later."
-* Produce a dense grid with thickness Z (default 100 nm) and a region
-  index for every cell.
+Workflow
+--------
+1. Auto-detect the pixel length of the black bar inside ``scalebar.png``
+   and convert it into a global nm/pixel using the known bar length
+   (default 10 um).
+2. Segment ``image.png`` by colour and expose a K-mean-clustered label
+   map.  The user then tells us explicitly which physical region
+   number to attach to each cluster, e.g. ``{cluster: region_id}``.
+3. The user assigns a material to each region_id.  The special token
+   ``"SIMS"`` signals that this region's doping will be supplied via
+   SIMS profile applications (see ``sims.py``).
+
+All coordinates exposed by :class:`SampleModel` are in **nanometres**
+with ``(x, y) = (0, 0)`` at the top-left corner of the image to match
+the way the image is shown on screen (positive y goes downwards).
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -20,127 +23,176 @@ from PIL import Image
 from sklearn.cluster import KMeans
 
 
+# ---------------------------------------------------------------------------
+# Scale-bar detection (separate image)
+# ---------------------------------------------------------------------------
+def detect_scale_from_image(scalebar_path: str, bar_length_um: float = 10.0,
+                             darkness: int = 80) -> float:
+    """Return nm / pixel using the length of the dark bar in the image.
+
+    The heuristic looks for the longest consecutive run of dark
+    pixels in any row of the image.  That run is assumed to be the
+    scale bar of length ``bar_length_um`` (default 10 um).
+    """
+    gray = np.asarray(Image.open(scalebar_path).convert("L"))
+    mask = gray < darkness
+    best = 0
+    for row in mask:
+        if not row.any():
+            continue
+        idx = np.flatnonzero(row)
+        runs = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+        best = max(best, max(len(r) for r in runs))
+    if best < 5:
+        raise ValueError("Could not find a scale bar in the image")
+    return bar_length_um * 1000.0 / best         # nm per pixel
+
+
+# ---------------------------------------------------------------------------
+# Colour segmentation
+# ---------------------------------------------------------------------------
+def cluster_image(img: np.ndarray, n_clusters: int,
+                   background_threshold: int = 235) -> np.ndarray:
+    """Return an integer label image; 0 = background, 1..k = clusters."""
+    h, w, _ = img.shape
+    fg_mask = np.any(img < background_threshold, axis=2)
+    labels = np.zeros((h, w), dtype=np.int32)
+    if not fg_mask.any():
+        return labels
+    fg_pixels = img[fg_mask].reshape(-1, 3)
+    if n_clusters <= 1:
+        labels[fg_mask] = 1
+        return labels
+    km = KMeans(n_clusters=n_clusters, n_init=5, random_state=0).fit(fg_pixels)
+    labels[fg_mask] = km.labels_ + 1
+    return labels
+
+
+# ---------------------------------------------------------------------------
+# Sample model
+# ---------------------------------------------------------------------------
 @dataclass
 class SampleModel:
-    """Dense 2-D sample description produced by :func:`build_model`."""
-    image: np.ndarray                        # (H, W, 3) uint8
-    region_mask: np.ndarray                  # (H, W) int - 0 = background
-    region_ids: list[int] = field(default_factory=list)
-    nm_per_pixel: float = 1.0
-    thickness_nm: float = 100.0
-    # map region_id -> material name (or "SIMS")
-    material_map: dict[int, str] = field(default_factory=dict)
+    image: np.ndarray                    # (H, W, 3) uint8
+    cluster_mask: np.ndarray             # (H, W) int raw KMeans labels
+    region_mask: np.ndarray              # (H, W) int user-assigned region ids
+    nm_per_pixel: float
+    thickness_nm: float
+    # region_id  ->  material name or "SIMS"
+    materials: dict[int, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
-    # Grid helpers
-    # ------------------------------------------------------------------
+    @property
+    def shape(self):
+        return self.region_mask.shape
+
     @property
     def extent_nm(self):
+        """Extent for matplotlib ``imshow``.  Positive y goes **down** so
+        ``origin='upper'`` (the default) keeps the sample visually
+        upright."""
         h, w = self.region_mask.shape
-        return (0.0, w * self.nm_per_pixel, 0.0, h * self.nm_per_pixel)
+        return (0.0, w * self.nm_per_pixel,
+                h * self.nm_per_pixel, 0.0)
+
+    def xy_grids_nm(self):
+        """Return ``(X_nm, Y_nm)`` 2-D grids of coordinates in nm."""
+        h, w = self.region_mask.shape
+        px = self.nm_per_pixel
+        x = (np.arange(w) + 0.5) * px
+        y = (np.arange(h) + 0.5) * px
+        return np.meshgrid(x, y)
 
     def region_bbox_nm(self, rid: int):
         ys, xs = np.where(self.region_mask == rid)
         if xs.size == 0:
             return None
-        x0, x1 = xs.min() * self.nm_per_pixel, (xs.max() + 1) * self.nm_per_pixel
-        y0, y1 = ys.min() * self.nm_per_pixel, (ys.max() + 1) * self.nm_per_pixel
-        return x0, x1, y0, y1
+        p = self.nm_per_pixel
+        return (xs.min() * p, xs.max() * p,
+                ys.min() * p, ys.max() * p)
 
-    def region_width_nm(self, rid: int):
-        bb = self.region_bbox_nm(rid)
-        return None if bb is None else bb[1] - bb[0]
+    def region_ids(self):
+        return sorted(int(r) for r in np.unique(self.region_mask) if r != 0)
 
+    def set_material(self, rid: int, name: str):
+        self.materials[int(rid)] = name
+        return self
 
-# ---------------------------------------------------------------------------
-# Scale-bar detection
-# ---------------------------------------------------------------------------
-def detect_scale_bar(img: np.ndarray, known_um: float = 10.0,
-                      darkness: int = 80) -> float | None:
-    """Estimate nm / pixel by finding the longest dark horizontal run.
+    # ------------------------------------------------------------------
+    # Region editing helpers
+    # ------------------------------------------------------------------
+    def assign_clusters_to_regions(self, mapping: dict[int, int]):
+        """``mapping`` = ``{cluster_id: region_id}``.
 
-    The simple heuristic: threshold near-black pixels, then find the row
-    containing the longest consecutive dark run.  That run is assumed to
-    be the scale bar of length ``known_um``.
-    """
-    gray = np.asarray(Image.fromarray(img).convert("L"))
-    mask = gray < darkness
-    best_row_run = 0
-    for row in mask:
-        # longest run of True in this row
-        if not row.any():
-            continue
-        idx = np.flatnonzero(row)
-        gaps = np.diff(idx)
-        runs = np.split(idx, np.where(gaps > 1)[0] + 1)
-        longest = max(len(r) for r in runs)
-        if longest > best_row_run:
-            best_row_run = longest
-    if best_row_run < 10:
-        return None
-    return known_um * 1000.0 / best_row_run        # nm per pixel
+        Re-labels :attr:`region_mask` so that every pixel belonging to
+        cluster ``c`` in :attr:`cluster_mask` becomes region ``mapping[c]``.
+        Cluster ids not listed end up in region 0 (background).
+        """
+        new_mask = np.zeros_like(self.cluster_mask)
+        for cid, rid in mapping.items():
+            new_mask[self.cluster_mask == cid] = int(rid)
+        self.region_mask = new_mask
+        return self
 
+    # ---------------- manual region specification ----------------
+    def clear_regions(self):
+        self.region_mask = np.zeros_like(self.cluster_mask)
+        self.materials = {}
+        return self
 
-# ---------------------------------------------------------------------------
-# Region segmentation by colour
-# ---------------------------------------------------------------------------
-def segment_regions(img: np.ndarray, n_regions: int = 1,
-                    background_threshold: int = 235) -> np.ndarray:
-    """Return a mask where 0 = background and 1..k = detected regions.
+    def add_region_bbox(self, rid: int, *,
+                        x_nm: tuple[float, float] | None = None,
+                        y_nm: tuple[float, float] | None = None):
+        """Paint the rectangle ``x_nm x y_nm`` with ``rid`` (integer).
 
-    ``n_regions`` is the number of non-background colour clusters to
-    keep.  For the simple demo image it is just 1.
-    """
-    h, w, _ = img.shape
-    fg_mask = np.any(img < background_threshold, axis=2)
-    mask = np.zeros((h, w), dtype=np.int32)
-    fg_pixels = img[fg_mask].reshape(-1, 3)
-    if fg_pixels.size == 0:
-        return mask
+        Bounds default to the full image if an axis is not specified.
+        """
+        H, W = self.cluster_mask.shape
+        px = self.nm_per_pixel
+        x_lo, x_hi = x_nm if x_nm is not None else (0.0, W * px)
+        y_lo, y_hi = y_nm if y_nm is not None else (0.0, H * px)
+        c0 = max(0, int(np.floor(x_lo / px)))
+        c1 = min(W, int(np.ceil (x_hi / px)))
+        r0 = max(0, int(np.floor(y_lo / px)))
+        r1 = min(H, int(np.ceil (y_hi / px)))
+        self.region_mask[r0:r1, c0:c1] = int(rid)
+        return self
 
-    k = max(1, n_regions)
-    if k == 1:
-        mask[fg_mask] = 1
-        return mask
-
-    km = KMeans(n_clusters=k, n_init=5, random_state=0).fit(fg_pixels)
-    labels = km.labels_ + 1        # so background stays at 0
-    mask[fg_mask] = labels
-    return mask
+    def add_region_from_color(self, rid: int,
+                               rgb: tuple[int, int, int],
+                               tolerance: int = 40):
+        """Paint every pixel matching ``rgb`` (+/- tolerance) with ``rid``."""
+        r, g, b = rgb
+        dr = self.image[..., 0].astype(int) - r
+        dg = self.image[..., 1].astype(int) - g
+        db = self.image[..., 2].astype(int) - b
+        mask = (np.abs(dr) <= tolerance) & \
+                (np.abs(dg) <= tolerance) & \
+                (np.abs(db) <= tolerance)
+        self.region_mask[mask] = int(rid)
+        return self
 
 
 # ---------------------------------------------------------------------------
 # Top-level entry point
 # ---------------------------------------------------------------------------
-def build_model(image_path: str,
-                material_map: dict[int, str],
-                nm_per_pixel: float | None = None,
-                scalebar_um: float = 10.0,
+def build_model(image_path: str, scalebar_path: str,
+                n_clusters: int,
                 thickness_nm: float = 100.0,
-                n_regions: int | None = None) -> SampleModel:
-    """Load an image and produce a :class:`SampleModel`.
+                bar_length_um: float = 10.0) -> SampleModel:
+    """Load an image + scale bar and return a :class:`SampleModel`.
 
-    Parameters
-    ----------
-    material_map : dict
-        ``{region_id: material_name}``.  ``material_name`` can be any key
-        from the material table, or the literal string ``"SIMS"``.
-    nm_per_pixel : float, optional
-        Override the auto-detected scale.
+    The caller completes the model by calling
+    ``assign_clusters_to_regions`` and ``set_material`` (or passing
+    ``SampleModel(...).materials = {...}``).
     """
     img = np.asarray(Image.open(image_path).convert("RGB"))
-    if nm_per_pixel is None:
-        nm_per_pixel = detect_scale_bar(img, known_um=scalebar_um) or 1.0
-
-    n = n_regions if n_regions is not None else max(material_map.keys())
-    mask = segment_regions(img, n_regions=n)
-    rids = [i for i in np.unique(mask) if i != 0]
-
+    nm_per_pixel = detect_scale_from_image(scalebar_path, bar_length_um)
+    cluster_mask = cluster_image(img, n_clusters=n_clusters)
     return SampleModel(
         image=img,
-        region_mask=mask,
-        region_ids=rids,
+        cluster_mask=cluster_mask,
+        region_mask=cluster_mask.copy(),   # default 1:1 mapping
         nm_per_pixel=float(nm_per_pixel),
         thickness_nm=float(thickness_nm),
-        material_map=dict(material_map),
     )

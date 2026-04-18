@@ -1,310 +1,404 @@
-"""Core device physics for the EBIC simulator.
+"""Device-physics solver for 2-D TEM-EBIC simulation.
 
-This module solves - along a horizontal line through the sample - the
-sequence
+The simulator works on a Cartesian grid of the sample.  For each
+placement of a SIMS profile the doping varies along the depth
+direction; junctions are therefore lines perpendicular to that
+direction.  We reuse the 1-D depletion / E-field solution along the
+depth axis and extrude it across the placement band to build 2-D
+fields.
 
-    doping(x)   ->   rho(x)   ->   E(x)   ->   V(x)   ->   band(x)
-
-using *integration* (cumulative trapezoid) rather than the textbook
-``V_bi / W`` short-cuts, plus the depletion edges found implicitly from
-charge balance.  On top of that we compute:
-
-    * Kanaya-Okayama generation range (bulb size)
-    * Collection probability using drift + diffusion
-    * EBIC and SEEBIC signals
-
-The simulator operates on a 1-D slice because TEM cross-sections are
-effectively planar along the electron-beam direction; the caller may
-pick which row of the 2-D region mask to slice.
+Exposed quantities
+------------------
+* 1-D slice helpers :  :func:`extract_slice` + the classic
+  :func:`depletion_region_1d`, :func:`electric_field_1d`
+* 2-D maps         :  :func:`build_2d_fields`, :func:`collection_probability_2d`
+* EBIC / SEEBIC    :  :func:`ebic_scan_2d`, :func:`seebic_scan_2d`
 """
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 from scipy.integrate import cumulative_trapezoid
-from scipy.interpolate import interp1d
+from scipy.ndimage import distance_transform_edt
 
 from . import constants as C
 from . import materials as _mat
+from .beam import kanaya_okayama_range_nm, BeamCondition
+from .sims import ProfilePlacement
 
 
 # ---------------------------------------------------------------------------
-# Kanaya-Okayama range
-# ---------------------------------------------------------------------------
-def kanaya_okayama_range_nm(E_keV: float, A: float = 28.09,
-                             Z: float = 14.0, rho: float = 2.329) -> float:
-    """K-O range in **nm** for beam energy ``E_keV``.
-
-    Defaults are for silicon (A=28.09 g/mol, Z=14, rho=2.329 g/cm^3).
-    Formula returns micrometres, so we convert to nanometres.
-    """
-    R_um = 0.0276 * A * E_keV ** 1.67 / (Z ** 0.889 * rho)
-    return R_um * 1000.0
-
-
-# ---------------------------------------------------------------------------
-# 1-D slice extraction
+# 1-D slice object
 # ---------------------------------------------------------------------------
 @dataclass
 class Slice1D:
-    x_nm:   np.ndarray        # distance along the slice (nm)
+    x_nm:   np.ndarray
     Na:     np.ndarray
     Nd:     np.ndarray
     Nnet:   np.ndarray
     eps_r:  np.ndarray
-    region: np.ndarray        # region_id per cell (0 outside sample)
 
 
-def extract_slice(model, Na_map, Nd_map, eps_r_map,
-                  row: int | None = None) -> Slice1D:
-    """Pull a 1-D horizontal slice out of the 2-D maps."""
-    if row is None:
-        row = model.region_mask.shape[0] // 2
-    rm  = model.region_mask[row]
-    # keep only inside-sample pixels
-    in_sample = rm > 0
-    cols = np.where(in_sample)[0]
-    if cols.size == 0:
-        raise ValueError("Slice row is entirely outside the sample")
-    x_nm = (cols - cols[0]) * model.nm_per_pixel
-    Na = np.nan_to_num(Na_map[row, cols])
-    Nd = np.nan_to_num(Nd_map[row, cols])
-    return Slice1D(
-        x_nm=x_nm, Na=Na, Nd=Nd, Nnet=Nd - Na,
-        eps_r=eps_r_map[row, cols], region=rm[cols],
-    )
+def extract_slice_along_placement(model, Na_map, Nd_map, eps_r_map,
+                                   placement: ProfilePlacement) -> Slice1D:
+    """Pull a 1-D slice along the depth direction of a placement.
 
-
-# ---------------------------------------------------------------------------
-# Depletion region: integration-based
-# ---------------------------------------------------------------------------
-def _peak_doping_near(abs_Nnet: np.ndarray, idx: int, direction: int,
-                       search_cells: int = 64) -> float:
-    """Peak |Nnet| within ``search_cells`` of ``idx`` in the given direction.
-
-    ``direction`` is -1 for "look left", +1 for "look right".  Using a
-    peak (rather than a mean) keeps the junction-facing heavy doping
-    from being washed out by a distant lightly-doped substrate.
+    The slice is taken at the midpoint of the transverse range, clipped
+    to the actual image bounds so the row/column index is always valid.
     """
-    if direction < 0:
-        lo = max(0, idx - search_cells)
-        segment = abs_Nnet[lo:idx + 1]
+    X, Y = model.xy_grids_nm()
+    H, W = model.shape
+    px = model.nm_per_pixel
+    lo, hi = placement.range_nm
+
+    if placement.axis == "x":
+        y_min, y_max = 0.0, H * px
+        mid = 0.5 * (max(lo, y_min) + min(hi, y_max))
+        row = int(np.clip(round(mid / px - 0.5), 0, H - 1))
+        x_nm = X[row, :]
+        Na = Na_map[row, :]; Nd = Nd_map[row, :]; eps = eps_r_map[row, :]
+        if placement.direction == "+x":
+            keep = x_nm >= placement.pos_nm
+            coord_full = x_nm - placement.pos_nm
+        else:
+            keep = x_nm <= placement.pos_nm
+            coord_full = placement.pos_nm - x_nm
+        order = np.argsort(coord_full[keep])
+        coord = coord_full[keep][order]
+        Na = np.nan_to_num(Na[keep][order])
+        Nd = np.nan_to_num(Nd[keep][order])
+        eps = eps[keep][order]
     else:
-        hi = min(len(abs_Nnet), idx + 1 + search_cells)
-        segment = abs_Nnet[idx + 1:hi]
-    if segment.size == 0:
+        x_min, x_max = 0.0, W * px
+        mid = 0.5 * (max(lo, x_min) + min(hi, x_max))
+        col = int(np.clip(round(mid / px - 0.5), 0, W - 1))
+        y_nm = Y[:, col]
+        Na = Na_map[:, col]; Nd = Nd_map[:, col]; eps = eps_r_map[:, col]
+        if placement.direction == "+y":
+            keep = y_nm >= placement.pos_nm
+            coord_full = y_nm - placement.pos_nm
+        else:
+            keep = y_nm <= placement.pos_nm
+            coord_full = placement.pos_nm - y_nm
+        order = np.argsort(coord_full[keep])
+        coord = coord_full[keep][order]
+        Na = np.nan_to_num(Na[keep][order])
+        Nd = np.nan_to_num(Nd[keep][order])
+        eps = eps[keep][order]
+
+    # drop cells outside the sample (no permittivity assigned)
+    good = np.isfinite(eps)
+    if not np.any(good):
+        return Slice1D(x_nm=np.array([0.0]), Na=np.array([0.0]),
+                        Nd=np.array([0.0]), Nnet=np.array([0.0]),
+                        eps_r=np.array([C.EPS_R_SI]))
+    coord = coord[good]; Na = Na[good]; Nd = Nd[good]; eps = eps[good]
+    coord = coord - coord.min()
+    return Slice1D(x_nm=coord, Na=Na, Nd=Nd,
+                    Nnet=Nd - Na, eps_r=eps)
+
+
+# ---------------------------------------------------------------------------
+# 1-D depletion region (junction-by-junction)
+# ---------------------------------------------------------------------------
+def _peak_near(absN, idx, direction, n_cells):
+    if direction < 0:
+        seg = absN[max(0, idx - n_cells):idx + 1]
+    else:
+        seg = absN[idx + 1:min(len(absN), idx + 1 + n_cells)]
+    if seg.size == 0:
         return 1e14
-    return float(segment.max())
+    return float(seg.max())
 
 
-def depletion_region(sl: Slice1D, T: float = C.T_DEFAULT,
-                      search_nm: float = 600.0) -> dict:
-    """Find the depletion region around each junction.
-
-    Every sign change of ``Nnet`` is treated as a metallurgical
-    junction.  Two dopings characterising the junction are taken as the
-    **peak** |Nnet| values on each side within ``search_nm`` of the
-    boundary (peaks rather than means so distant substrate doesn't
-    contaminate the estimate).  The total depletion width comes from
-    the standard one-sided closed form, then split by charge balance.
-    """
+def depletion_region_1d(sl: Slice1D, T: float = C.T_DEFAULT,
+                         search_nm: float = 600.0) -> dict:
     Nnet = sl.Nnet
     absN = np.abs(Nnet)
-    x    = sl.x_nm * 1e-7                    # -> cm
-    dx_nm = float(np.mean(np.diff(sl.x_nm))) if len(sl.x_nm) > 1 else 1.0
-    search_cells = max(4, int(round(search_nm / max(dx_nm, 1e-6))))
+    x = sl.x_nm * 1e-7
+    dx = float(np.mean(np.diff(sl.x_nm))) if len(sl.x_nm) > 1 else 1.0
+    n = max(4, int(round(search_nm / max(dx, 1e-6))))
 
     junctions = []
     sign = np.sign(Nnet)
-    idxs = np.where(np.diff(sign) != 0)[0]
-    for j in idxs:
+    for j in np.where(np.diff(sign) != 0)[0]:
         if sign[j] == 0 or sign[j + 1] == 0:
             continue
-        x_j = 0.5 * (x[j] + x[j + 1])
-        eps = sl.eps_r[j] * C.eps0 * 1e-2    # F/cm
-
-        N_left  = _peak_doping_near(absN, j, -1, search_cells)
-        N_right = _peak_doping_near(absN, j, +1, search_cells)
+        eps = sl.eps_r[j] * C.eps0 * 1e-2
+        N_left  = _peak_near(absN, j, -1, n)
+        N_right = _peak_near(absN, j, +1, n)
         ni  = float(_mat.ni_effective(max(N_left, N_right), T))
         Vbi = (C.kB * T / C.q) * np.log(max(N_left * N_right /
                                              max(ni, 1.0) ** 2, 1.0))
+        W = np.sqrt(2.0 * eps * Vbi / C.q *
+                    (N_left + N_right) / (N_left * N_right))
+        w_left  = W * N_right / (N_left + N_right)
+        w_right = W - w_left
 
-        W_tot = np.sqrt(2.0 * eps * Vbi / C.q *
-                        (N_left + N_right) / (N_left * N_right))
-        # charge balance: N_left * w_left = N_right * w_right
-        w_left  = W_tot * N_right / (N_left + N_right)
-        w_right = W_tot - w_left
-
-        # junction type classification
         left_sign  = np.sign(Nnet[max(j - 1, 0)])
         right_sign = np.sign(Nnet[min(j + 2, len(Nnet) - 1)])
-        if left_sign < 0 and right_sign > 0:
-            kind = "PN"
-        elif left_sign > 0 and right_sign < 0:
+        if left_sign > 0 and right_sign < 0:
             kind = "NP"
+        elif left_sign < 0 and right_sign > 0:
+            kind = "PN"
         else:
             kind = "HL"
-
         junctions.append(dict(
-            index=j, x_nm=x_j * 1e7,
-            type=kind, Vbi=Vbi, W_total_nm=W_tot * 1e7,
-            # "xp" keeps the original naming: width on the left of junction
-            xp_nm=w_left * 1e7, xn_nm=w_right * 1e7,
+            index=j, x_nm=0.5 * (sl.x_nm[j] + sl.x_nm[j + 1]),
+            type=kind, Vbi=Vbi, W_total_nm=W * 1e7,
+            w_left_nm=w_left * 1e7, w_right_nm=w_right * 1e7,
             N_left=N_left, N_right=N_right,
+            left_sign=float(left_sign), right_sign=float(right_sign),
         ))
     return dict(junctions=junctions)
 
 
 # ---------------------------------------------------------------------------
-# Electric field via Poisson integration of the charge density
+# 1-D field
 # ---------------------------------------------------------------------------
-def electric_field(sl: Slice1D, depletion: dict) -> dict:
-    """Compute E(x) and V(x) along the slice via Poisson integration.
-
-    Uses the depletion approximation with the junction-facing peak
-    dopings (so charge balance across each junction is exact and E
-    returns to zero on both neutral sides).  ``rho`` on the N side is
-    ``+q N_N`` and on the P side ``-q N_P``, where N_N, N_P come from
-    :func:`depletion_region`.
-    """
-    x_cm = sl.x_nm * 1e-7
-    eps  = sl.eps_r * C.eps0 * 1e-2     # F/cm
-    rho  = np.zeros_like(sl.Nnet)
-
+def electric_field_1d(sl: Slice1D, depletion: dict) -> dict:
+    x = sl.x_nm * 1e-7
+    eps = sl.eps_r * C.eps0 * 1e-2
+    rho = np.zeros_like(sl.Nnet)
     for j in depletion["junctions"]:
         idx = j["index"]
-        xj  = x_cm[idx]
-        w_left  = j["xp_nm"] * 1e-7
-        w_right = j["xn_nm"] * 1e-7
-        # figure out which side is N and which is P from the junction kind
-        if j["type"] == "NP":
-            sign_left, sign_right = +1.0, -1.0
-        elif j["type"] == "PN":
-            sign_left, sign_right = -1.0, +1.0
-        else:   # high-low: use Nnet signs of the first neighbour either side
-            sign_left  = float(np.sign(sl.Nnet[max(idx - 1, 0)]))
-            sign_right = float(np.sign(sl.Nnet[min(idx + 2, len(sl.Nnet) - 1)]))
-
-        left  = (x_cm >= xj - w_left) & (x_cm <= xj)
-        right = (x_cm >= xj) & (x_cm <= xj + w_right)
-        rho[left]  += sign_left  * C.q * j["N_left"]
-        rho[right] += sign_right * C.q * j["N_right"]
-
-    E = cumulative_trapezoid(rho / eps, x_cm, initial=0.0)    # V/cm
-    V = -cumulative_trapezoid(E, x_cm, initial=0.0)           # V
+        xj = x[idx]
+        wl = j["w_left_nm"] * 1e-7
+        wr = j["w_right_nm"] * 1e-7
+        left  = (x >= xj - wl) & (x <= xj)
+        right = (x >= xj) & (x <= xj + wr)
+        rho[left]  += j["left_sign"]  * C.q * j["N_left"]
+        rho[right] += j["right_sign"] * C.q * j["N_right"]
+    E = cumulative_trapezoid(rho / eps, x, initial=0.0)
+    V = -cumulative_trapezoid(E, x, initial=0.0)
     return dict(E_Vcm=E, V_V=V, rho_Ccm3=rho)
 
 
-# ---------------------------------------------------------------------------
-# Band diagram
-# ---------------------------------------------------------------------------
-def band_diagram(sl: Slice1D, V: np.ndarray, Eg_base: float = C.EG_SI_300K):
-    """Return Ec, Ev, Ef references along the slice.
+def band_diagram_1d(sl: Slice1D, V: np.ndarray,
+                     Eg_base: float = C.EG_SI_300K):
+    Eg = _mat.bandgap(np.maximum(np.abs(sl.Nnet), 1.0), Eg_base)
+    Ec = -V
+    return dict(Ec=Ec, Ev=Ec - Eg, Ef=np.zeros_like(Ec), Eg=Eg)
 
-    The reference is chosen so that the Fermi level is flat at 0 eV in
-    the absence of applied bias (equilibrium).  BGN is applied per
-    cell through :func:`materials.bandgap`.
+
+# ---------------------------------------------------------------------------
+# 2-D extrusion across a placement band
+# ---------------------------------------------------------------------------
+def _placement_key(pl: ProfilePlacement):
+    return (pl.axis, float(pl.pos_nm),
+             float(pl.range_nm[0]), float(pl.range_nm[1]),
+             pl.direction)
+
+
+def build_2d_fields(model, Na_map, Nd_map, eps_r_map,
+                     placements: list[ProfilePlacement],
+                     T: float = C.T_DEFAULT):
+    """Compute 2-D E, V, depletion-mask and junction list.
+
+    Placements that share (axis, pos, range, direction) are deduped so
+    we don't double-count the same physical junction when both a P-
+    and an N-type SIMS profile live on the same surface.  For each
+    unique placement key we take a 1-D slice along the depth axis,
+    run the 1-D Poisson solve, and extrude the result across the
+    transverse range.
     """
-    N_abs = np.maximum(np.abs(sl.Nnet), 1.0)
-    Eg    = _mat.bandgap(N_abs, Eg_base)
-    chi   = C.CHI_SI
-    # E_vac = chi + Ec   ;   Ec = -q*V + (reference)
-    Ec = -V + chi * 0.0 - 0.0                 # shift is arbitrary
-    Ev = Ec - Eg
-    Ef = np.zeros_like(Ec)
-    return dict(Ec=Ec, Ev=Ev, Ef=Ef, Eg=Eg)
+    H, W = model.shape
+    X, Y = model.xy_grids_nm()
+
+    Ex = np.zeros((H, W))
+    Ey = np.zeros((H, W))
+    V2 = np.zeros((H, W))
+    dep_mask = np.zeros((H, W), dtype=bool)
+    junctions_2d = []      # list of (x_nm, y_nm, type, Vbi, W, ...)
+
+    seen: dict = {}
+    for pl in placements:
+        seen.setdefault(_placement_key(pl), pl)
+
+    for pl in seen.values():
+        sl = extract_slice_along_placement(model, Na_map, Nd_map,
+                                            eps_r_map, pl)
+        dep = depletion_region_1d(sl, T=T)
+        ef  = electric_field_1d(sl, dep)
+        lo, hi = pl.range_nm
+
+        # build a depth map (NaN outside the active band) and
+        # interpolate 1-D E, V along depth coordinate
+        depth = pl.depth_map(X, Y)
+        mask = np.isfinite(depth)
+        d_vals = depth[mask]
+
+        # 1-D E along depth (V/cm -> V/m for the stored field? keep V/cm)
+        E1 = np.interp(d_vals, sl.x_nm, ef["E_Vcm"], left=0.0, right=0.0)
+        V1 = np.interp(d_vals, sl.x_nm, ef["V_V"],  left=0.0,
+                        right=float(ef["V_V"][-1]))
+        V2[mask] += V1
+        # direction-aware assignment
+        if pl.direction == "+x":
+            Ex[mask] += E1
+        elif pl.direction == "-x":
+            Ex[mask] -= E1
+        elif pl.direction == "+y":
+            Ey[mask] += E1
+        elif pl.direction == "-y":
+            Ey[mask] -= E1
+
+        # depletion mask per placement
+        for j in dep["junctions"]:
+            in_dep_1d = ((d_vals >= j["x_nm"] - j["w_left_nm"]) &
+                          (d_vals <= j["x_nm"] + j["w_right_nm"]))
+            tmp = np.zeros_like(mask)
+            tmp[mask] = in_dep_1d
+            dep_mask |= tmp
+
+            # remember the junction location for overlay plotting
+            # junction line passes through depth = j["x_nm"] along the
+            # transverse axis
+            tr_lo, tr_hi = pl.range_nm
+            if pl.axis == "x":
+                # surface at x=pos, depth along x ; junction at
+                # x = pos +/- x_nm depending on direction
+                xj = (pl.pos_nm + j["x_nm"]) if pl.direction == "+x" else (pl.pos_nm - j["x_nm"])
+                junctions_2d.append(dict(kind=j["type"], axis="x", pos=xj,
+                                          span=(tr_lo, tr_hi),
+                                          Vbi=j["Vbi"], W_nm=j["W_total_nm"]))
+            else:
+                yj = (pl.pos_nm + j["x_nm"]) if pl.direction == "+y" else (pl.pos_nm - j["x_nm"])
+                junctions_2d.append(dict(kind=j["type"], axis="y", pos=yj,
+                                          span=(tr_lo, tr_hi),
+                                          Vbi=j["Vbi"], W_nm=j["W_total_nm"]))
+
+    E_mag = np.sqrt(Ex ** 2 + Ey ** 2)
+    return dict(Ex=Ex, Ey=Ey, E_Vcm=E_mag, V_V=V2,
+                 dep_mask=dep_mask, junctions=junctions_2d)
 
 
 # ---------------------------------------------------------------------------
-# Collection probability
+# 2-D collection probability
 # ---------------------------------------------------------------------------
-def collection_probability(sl: Slice1D, depletion: dict,
-                            tau_s: float = 1e-6,
-                            T: float = C.T_DEFAULT) -> np.ndarray:
-    """Probability that a carrier generated at position x reaches a contact.
+def collection_probability_2d(model, Na_map, Nd_map, dep_mask,
+                               tau_s: float = 1.0e-6,
+                               T: float = C.T_DEFAULT) -> np.ndarray:
+    """P(r) = 1 inside depletion, ``exp(-d / L(r))`` outside.
 
-    * Inside any depletion region -> P = 1 (drift-dominated)
-    * Outside -> P = exp(-distance_to_nearest_edge / L_local) where L
-      comes from Arora diffusion coefficient + ``tau_s``.
+    Distance ``d`` is a 2-D Euclidean distance (in nm) to the nearest
+    depletion pixel.  Diffusion length is taken per pixel from the
+    minority carrier in the locally dominant dopant (Arora + Einstein).
     """
-    x_nm = sl.x_nm
-    P = np.zeros_like(x_nm, dtype=float)
+    px = model.nm_per_pixel
+    d_nm = distance_transform_edt(~dep_mask) * px     # nm
 
-    edges = []
-    for j in depletion["junctions"]:
-        edges.append((j["x_nm"] - j["xp_nm"], j["x_nm"] + j["xn_nm"]))
-    if not edges:
-        return P
-
-    # L is minority-carrier diffusion length; use the smaller of
-    # electron (in p) and hole (in n) depending on local doping sign
-    Nabs = np.maximum(np.abs(sl.Nnet), 1.0)
-    L_cm = np.where(sl.Nnet < 0,
-                    _mat.diffusion_length(Nabs, tau_s, "electron", T),
-                    _mat.diffusion_length(Nabs, tau_s, "hole", T))
+    Nabs = np.nan_to_num(np.abs(Nd_map - Na_map))
+    Nabs = np.maximum(Nabs, 1.0)
+    # Nnet sign map (vectorised)
+    Nnet = Nd_map - Na_map
+    L_cm = np.where(np.nan_to_num(Nnet) < 0,
+                     _mat.diffusion_length(Nabs, tau_s, "electron", T),
+                     _mat.diffusion_length(Nabs, tau_s, "hole", T))
     L_nm = L_cm * 1e7
+    L_nm = np.where(np.isfinite(L_nm) & (L_nm > 0), L_nm, np.inf)
 
-    for i, xi in enumerate(x_nm):
-        inside = False
-        min_d  = np.inf
-        for (a, b) in edges:
-            if a <= xi <= b:
-                inside = True
-                break
-            min_d = min(min_d, abs(xi - a), abs(xi - b))
-        if inside:
-            P[i] = 1.0
-        else:
-            P[i] = np.exp(-min_d / max(L_nm[i], 1e-6))
+    P = np.where(dep_mask, 1.0, np.exp(-d_nm / np.maximum(L_nm, 1e-6)))
+    # outside sample -> 0
+    P[model.region_mask == 0] = 0.0
     return P
 
 
 # ---------------------------------------------------------------------------
-# EBIC and SEEBIC
+# 2-D EBIC scan with Kanaya-Okayama generation
 # ---------------------------------------------------------------------------
-def _gaussian_bulb(x_nm, x0_nm, R_nm):
-    sigma = R_nm / 2.355      # FWHM == R
-    g = np.exp(-0.5 * ((x_nm - x0_nm) / sigma) ** 2)
-    norm = np.trapezoid(g, x_nm)
-    return g / norm if norm > 0 else g
+def _gaussian_kernel_2d(sigma_px: float, cutoff: float = 3.0):
+    half = int(np.ceil(cutoff * sigma_px))
+    if half < 1:
+        half = 1
+    yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+    g = np.exp(-0.5 * (xx ** 2 + yy ** 2) / sigma_px ** 2)
+    return g / g.sum()
 
 
-def ebic_scan(sl: Slice1D, depletion: dict, beam_kV: float,
-              beam_current_A: float = 1e-9, tau_s: float = 1e-6,
-              T: float = C.T_DEFAULT, A=28.09, Z=14.0, rho=2.329):
-    """Simulate the EBIC line scan.
+def ebic_scan_2d(model, P_map: np.ndarray, beam: BeamCondition,
+                  ko_A: float = 28.09, ko_Z: float = 14.0,
+                  ko_rho: float = 2.329,
+                  downsample: int = 4,
+                  use_thin_foil: bool = True):
+    """2-D EBIC map.
 
-    At every beam position x0 we deposit ``beam_kV * beam_current`` of
-    power, convert that to a generation rate using the material e-h pair
-    energy, distribute the generation over a Gaussian bulb of K-O radius,
-    and integrate ``g(x) * P(x)`` to get the collected current.
+    The collection probability is convolved with a Gaussian whose
+    lateral size is the effective bulb radius (K-O for bulk, capped at
+    ~3 x thickness for thin TEM foils).  The result at every pixel is
+    the probability-weighted overlap of a generation bulb centred
+    there.  The collected charge is ``q * N_eh * overlap`` where
+    ``N_eh`` is the number of e-h pairs actually produced in the foil
+    (not in a bulk sample).
+
+    Returns a dict with the 2-D **collected charge per beam position**
+    in C, the bulb radius, and the (downsampled) x/y grids in nm.
     """
-    R_nm = kanaya_okayama_range_nm(beam_kV, A, Z, rho)
-    P    = collection_probability(sl, depletion, tau_s=tau_s, T=T)
-    G0   = (beam_kV * 1e3 * beam_current_A / C.q) / C.EHP_ENERGY_SI_eV
-    #  e-h pairs / s generated by the beam
+    from scipy.signal import fftconvolve
 
-    I = np.zeros_like(sl.x_nm, dtype=float)
-    for i, x0 in enumerate(sl.x_nm):
-        g = _gaussian_bulb(sl.x_nm, x0, R_nm)
-        I[i] = C.q * G0 * np.trapezoid(g * P, sl.x_nm)
-    return dict(I_A=I, R_nm=R_nm, P=P)
+    R_nm_bulk = kanaya_okayama_range_nm(beam.energy_keV, ko_A, ko_Z, ko_rho)
+    if use_thin_foil:
+        R_nm = beam.effective_bulb_nm(model.thickness_nm,
+                                        A=ko_A, Z=ko_Z, rho=ko_rho)
+        N_eh = beam.total_eh_pairs(model.thickness_nm,
+                                     A=ko_A, Z=ko_Z, rho=ko_rho)
+    else:
+        R_nm = R_nm_bulk
+        N_eh = beam.total_eh_pairs_bulk
+
+    sigma_nm = R_nm / 2.355
+    sigma_px = sigma_nm / model.nm_per_pixel
+
+    step = max(1, int(downsample))
+    Pc = P_map[::step, ::step]
+    sigma_c = sigma_px / step
+
+    kernel = _gaussian_kernel_2d(max(sigma_c, 0.5))
+    overlap = fftconvolve(Pc, kernel, mode="same")
+    overlap = np.clip(overlap, 0.0, 1.0)
+
+    Q = C.q * N_eh * overlap
+
+    px = model.nm_per_pixel
+    x_c = (np.arange(Pc.shape[1]) + 0.5) * px * step
+    y_c = (np.arange(Pc.shape[0]) + 0.5) * px * step
+
+    return dict(Q_C=Q, R_nm=R_nm, R_KO_bulk_nm=R_nm_bulk,
+                 sigma_nm=sigma_nm, N_eh=N_eh,
+                 x_nm=x_c, y_nm=y_c, P_coarse=Pc)
 
 
-def seebic_scan(sl: Slice1D, depletion: dict, ef: dict, beam_kV: float,
-                beam_current_A: float = 1e-9, se_yield: float = 0.1):
-    """Secondary-electron EBIC - current due to SE escape.
+# ---------------------------------------------------------------------------
+# 2-D SEEBIC
+# ---------------------------------------------------------------------------
+def seebic_scan_2d(model, fields: dict, beam: BeamCondition,
+                    se_yield: float = 0.1, downsample: int = 4):
+    """Secondary-electron EBIC map (bipolar contrast).
 
-    Much smaller bulb because SEs escape only from within a couple of
-    mean-free-paths of the surface.  We approximate this as a delta
-    function at the beam position and weight it by (1 + alpha * E_local)
-    to make the signal proportional to the local surface electric
-    field, which is what drives SEEBIC contrast in practice.
+    In SEEBIC the escaping SE current is modulated by the local
+    surface potential: above a positively-biased region the SEs face
+    an additional attractive (or repulsive) surface voltage and the
+    collected current differs from its equilibrium value.  The
+    contrast is therefore proportional to the local electrostatic
+    potential, taken relative to its mean so the trace is bipolar
+    across the junction (classic S-shape along a line scan).
     """
-    E_abs = np.abs(ef["E_Vcm"])
-    # Normalise the field weighting (unit-less)
-    weight = 1.0 + E_abs / (E_abs.max() if E_abs.max() > 0 else 1.0)
-    I_prim = beam_current_A          # primary beam current
-    I_se   = se_yield * I_prim * weight
-    # Sign follows the sign of the lateral field
-    I_se *= np.sign(ef["E_Vcm"])
-    return dict(I_A=I_se)
+    step = max(1, int(downsample))
+    V = fields["V_V"][::step, ::step]
+    # reference = mean potential inside the sample
+    in_sample = model.region_mask[::step, ::step] > 0
+    if in_sample.any():
+        V_ref = V[in_sample].mean()
+    else:
+        V_ref = 0.0
+    dV = V - V_ref
+    Vmax = np.max(np.abs(dV))
+    if Vmax == 0:
+        Vmax = 1.0
+    contrast = dV / Vmax
+
+    Q = se_yield * beam.total_charge_C * contrast
+
+    px = model.nm_per_pixel
+    x_c = (np.arange(V.shape[1]) + 0.5) * px * step
+    y_c = (np.arange(V.shape[0]) + 0.5) * px * step
+    return dict(Q_C=Q, x_nm=x_c, y_nm=y_c, contrast=contrast, dV=dV)
