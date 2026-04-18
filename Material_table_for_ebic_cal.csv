@@ -1,0 +1,9 @@
+﻿Categroies,Unit,,,,,,,
+Material_name,a.u.,P-type_Si,Si,N-type_Si,Pt,Au,W,Al
+Type,a.u.,Semi,Semi,Semi,Metal,Metal,Metal,Metal
+Work_function,eV,Cal,4.85,Cal,5.65,5.1,4.55,4.28
+Electron_Affinity,eV,1.39,4.05,1.39,,,,
+Bandgap,eV,Cal,1.12,Cal,,,,
+Relative_permittivity,F/cm,1.17E+01,1.17E+01,1.17E+01,,,,
+Effective_e_mass,kg,1.08E+00,1.08E+00,1.08E+00,,,,
+Effective_h)mass,kg,8.10E-01,8.10E-01,8.10E-01,,,,
