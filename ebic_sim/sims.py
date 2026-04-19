@@ -71,17 +71,67 @@ def load_profile(csv_path: str, kind: str) -> SIMSProfile:
 # ---------------------------------------------------------------------------
 @dataclass
 class ProfilePlacement:
-    profile: SIMSProfile
-    axis: str                            # 'x' or 'y' - axis on which surface lies
-    pos_nm: float                        # position on that axis
-    range_nm: tuple[float, float]        # (lo, hi) on the OTHER axis
-    direction: str                       # '+x', '-x', '+y', '-y'
+    """Describe how a SIMS profile is laid out on the sample grid.
 
+    Two construction styles are supported:
+
+    1. **Manual**: caller sets ``axis``, ``pos_nm``, ``range_nm``,
+       ``direction`` explicitly.  ``range_nm`` is the transverse
+       extent on the OTHER axis and is optional for region-scoped
+       placements (then the range is taken from the region bounding
+       box).
+
+    2. **Region-scoped**: the caller uses :func:`ProfilePlacement.for_region`
+       which looks up the region bounding box and picks the surface as
+       the edge facing ``direction``.  This is the natural way to say
+       "SIMS applies inside region #N, with depth growing toward +y".
+
+    Pixels outside the region index listed in ``build_doping_maps``
+    are untouched even if they fall inside ``range_nm``; region
+    filtering has precedence.
+    """
+    profile: SIMSProfile
+    axis: str                            # 'x' or 'y'
+    pos_nm: float                        # surface position on the axis
+    direction: str                       # '+x' / '-x' / '+y' / '-y'
+    range_nm: tuple[float, float] | None = None   # transverse extent
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def for_region(cls, profile: "SIMSProfile", model,
+                    region_id: int, direction: str = "+y") -> "ProfilePlacement":
+        """Build a placement whose surface sits at the region edge
+        facing ``direction``, with the transverse range taken from the
+        region's bounding box."""
+        bb = model.region_bbox_nm(region_id)
+        if bb is None:
+            raise ValueError(f"region {region_id} is empty")
+        x_lo, x_hi, y_lo, y_hi = bb
+        if direction == "+y":
+            return cls(profile, axis="y", pos_nm=y_lo, direction="+y",
+                        range_nm=(x_lo, x_hi))
+        if direction == "-y":
+            return cls(profile, axis="y", pos_nm=y_hi, direction="-y",
+                        range_nm=(x_lo, x_hi))
+        if direction == "+x":
+            return cls(profile, axis="x", pos_nm=x_lo, direction="+x",
+                        range_nm=(y_lo, y_hi))
+        if direction == "-x":
+            return cls(profile, axis="x", pos_nm=x_hi, direction="-x",
+                        range_nm=(y_lo, y_hi))
+        raise ValueError(f"bad direction {direction!r}")
+
+    # ------------------------------------------------------------------
     def depth_map(self, X_nm: np.ndarray, Y_nm: np.ndarray) -> np.ndarray:
-        """Return a depth (nm) at every grid point, or NaN outside the
-        band where the profile is active."""
+        """Return a depth (nm) at every grid point, NaN outside the band
+        where the profile is active.  If ``range_nm`` is None the
+        transverse dimension is unrestricted - useful for region-scoped
+        placements that will be clipped later by ``build_doping_maps``."""
         depth = np.full_like(X_nm, np.nan)
-        lo, hi = self.range_nm
+        if self.range_nm is not None:
+            lo, hi = self.range_nm
+        else:
+            lo, hi = -np.inf, np.inf
         if self.direction == "+x":
             d = X_nm - self.pos_nm
             active = (d >= 0) & (Y_nm >= lo) & (Y_nm <= hi)

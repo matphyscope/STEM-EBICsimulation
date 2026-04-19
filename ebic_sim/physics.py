@@ -197,15 +197,21 @@ def _placement_key(pl: ProfilePlacement):
 
 def build_2d_fields(model, Na_map, Nd_map, eps_r_map,
                      placements: list[ProfilePlacement],
-                     T: float = C.T_DEFAULT):
-    """Compute 2-D E, V, depletion-mask and junction list.
+                     T: float = C.T_DEFAULT,
+                     applied_bias_V: float = 0.0):
+    """Compute 2-D **built-in** E and V, depletion mask, junction list.
+
+    The reported ``Ex``, ``Ey``, ``E_Vcm`` and ``V_V`` are the
+    equilibrium (zero-bias) built-in electric field / built-in
+    potential arising from the junction space-charge.  When
+    ``applied_bias_V`` is non-zero the widths of each depletion region
+    are rescaled by ``sqrt((Vbi - V_bias) / Vbi)`` (forward bias
+    shrinks them, reverse bias widens them) so the output field is the
+    *total* field under that bias.
 
     Placements that share (axis, pos, range, direction) are deduped so
     we don't double-count the same physical junction when both a P-
-    and an N-type SIMS profile live on the same surface.  For each
-    unique placement key we take a 1-D slice along the depth axis,
-    run the 1-D Poisson solve, and extrude the result across the
-    transverse range.
+    and an N-type SIMS profile live on the same surface.
     """
     H, W = model.shape
     X, Y = model.xy_grids_nm()
@@ -224,6 +230,15 @@ def build_2d_fields(model, Na_map, Nd_map, eps_r_map,
         sl = extract_slice_along_placement(model, Na_map, Nd_map,
                                             eps_r_map, pl)
         dep = depletion_region_1d(sl, T=T)
+        if applied_bias_V:
+            # rescale each junction's depletion widths for the applied bias
+            for j in dep["junctions"]:
+                Vbi = j["Vbi"]
+                V_eff = max(Vbi - applied_bias_V, 1e-3)
+                f = np.sqrt(V_eff / Vbi)
+                j["w_left_nm"]  *= f
+                j["w_right_nm"] *= f
+                j["W_total_nm"] *= f
         ef  = electric_field_1d(sl, dep)
         lo, hi = pl.range_nm
 
