@@ -35,11 +35,17 @@ from sklearn.cluster import KMeans
 # Image loading
 # ---------------------------------------------------------------------------
 def _flatten_alpha(path: str) -> np.ndarray:
-    """Read an image and return a plain RGB ``uint8`` array.  Transparent
-    areas are composited onto a white background so any "empty" region
-    is bright, not black."""
+    """Read an image (PNG / TIFF / BMP / JPG ...) and return a plain RGB
+    ``uint8`` array.  Transparent areas are composited onto a white
+    background so any "empty" region is bright, not black.  Multi-page
+    TIFFs fall back to the first frame.
+    """
     im = Image.open(path)
-    if im.mode in ("RGBA", "LA") or "transparency" in im.info:
+    # ensure we operate on the first frame for multi-page formats
+    if getattr(im, "n_frames", 1) > 1:
+        im.seek(0)
+    mode = im.mode
+    if mode in ("RGBA", "LA") or "transparency" in im.info:
         bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
         bg.alpha_composite(im.convert("RGBA"))
         im = bg.convert("RGB")
@@ -127,14 +133,29 @@ def _background_mask(rgb: np.ndarray, white_threshold: int = 235):
 def _strip_scalebar_region(rgb: np.ndarray, scalebar: dict,
                             pad: int = 10) -> np.ndarray:
     """Blank-out the scale-bar + label area so it isn't picked up as a
-    shape.  We zero out the full width up to x1 + pad, from the scale
-    bar's y - a few rows up to the image bottom."""
+    shape.  We zero out a rectangle that covers the scale bar's
+    horizontal extent (plus ``pad``) and everything above it up to
+    ~15 % of the image height (to catch the number label)."""
     out = rgb.copy()
-    H, W, _ = rgb.shape
+    H, _W, _ = rgb.shape
     y_top = max(0, scalebar["y"] - int(H * 0.15))        # label sits above
     x_right = scalebar["x1"] + pad
     out[y_top:, :x_right] = 255
     return out
+
+
+def _scalebar_mask(shape, scalebar: dict, pad: int = 10) -> np.ndarray:
+    """True where the scale-bar label / bar lives.  Used to drop those
+    pixels from the region mask regardless of how regions were later
+    assigned (colour match, bbox, ...)."""
+    H, W = shape
+    if not scalebar:
+        return np.zeros(shape, dtype=bool)
+    mask = np.zeros(shape, dtype=bool)
+    y_top = max(0, scalebar["y"] - int(H * 0.15))
+    x_right = min(W, scalebar["x1"] + pad)
+    mask[y_top:, :x_right] = True
+    return mask
 
 
 def segment_shapes(rgb: np.ndarray, n_clusters: int,
@@ -265,13 +286,15 @@ class SampleModel:
                                      keep_only_largest: bool = True):
         """Re-label ``region_mask`` from ``{cluster_id: region_id}``.
 
-        When ``keep_only_largest`` is True (default) only the biggest
-        connected component per cluster survives, which gets rid of
-        stray dust pixels from colour-segmentation noise.
+        Only the biggest connected component per cluster survives when
+        ``keep_only_largest`` is True (default).  The scale-bar area
+        is always dropped.
         """
         new_mask = np.zeros_like(self.cluster_mask)
+        sb_mask = _scalebar_mask(self.cluster_mask.shape, self.scalebar)
         for cid, rid in mapping.items():
             src = (self.cluster_mask == cid).astype(np.uint8)
+            src[sb_mask] = 0
             if keep_only_largest and src.any():
                 num, lbls, stats, _ = cv2.connectedComponentsWithStats(src, 8)
                 if num > 1:
@@ -280,6 +303,13 @@ class SampleModel:
             new_mask[src > 0] = int(rid)
         self.region_mask = new_mask
         return self
+
+    def _drop_scalebar_pixels(self):
+        """Zero out any region_mask pixels that fall inside the scale-bar /
+        label box.  Called automatically by :meth:`add_region_bbox` and
+        :meth:`add_region_from_color`."""
+        sb = _scalebar_mask(self.region_mask.shape, self.scalebar)
+        self.region_mask[sb] = 0
 
     def largest_contour_per_cluster(self):
         """Return ``{cluster_id: (contour, area, cx, cy)}`` with the
@@ -321,6 +351,7 @@ class SampleModel:
         r0 = max(0, int(np.floor(y_lo / p)))
         r1 = min(H, int(np.ceil (y_hi / p)))
         self.region_mask[r0:r1, c0:c1] = int(rid)
+        self._drop_scalebar_pixels()
         return self
 
     def add_region_from_color(self, rid: int,
@@ -333,11 +364,8 @@ class SampleModel:
         mask = ((np.abs(dr) <= tolerance)
                 & (np.abs(dg) <= tolerance)
                 & (np.abs(db) <= tolerance))
-        # also mask out the scalebar label region
-        if self.scalebar:
-            H, _W, _ = self.image.shape
-            y_top = max(0, self.scalebar["y"] - int(H * 0.15))
-            mask[y_top:, :self.scalebar["x1"] + 10] = False
+        # exclude the scalebar area
+        mask &= ~_scalebar_mask(self.image.shape[:2], self.scalebar)
         self.region_mask[mask] = int(rid)
         return self
 

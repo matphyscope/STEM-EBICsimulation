@@ -98,11 +98,11 @@ def plot_slice_doping(sl, title="1-D doping profile"):
 def plot_efield_1d(sl, ef, dep):
     fig, axes = plt.subplots(2, 1, sharex=True, figsize=(7, 5))
     axes[0].plot(sl.x_nm, ef["E_Vcm"] / 1e3)
-    axes[0].set_ylabel("E (kV/cm)")
-    axes[0].set_title("Electric field (1-D slice)")
+    axes[0].set_ylabel("E_bi (kV/cm)")
+    axes[0].set_title("Built-in electric field (1-D slice)")
     axes[1].plot(sl.x_nm, ef["V_V"])
-    axes[1].set_ylabel("V (V)"); axes[1].set_xlabel("depth (nm)")
-    axes[1].set_title("Potential")
+    axes[1].set_ylabel("V_bi (V)"); axes[1].set_xlabel("depth (nm)")
+    axes[1].set_title("Built-in potential")
     for ax in axes:
         for j in dep["junctions"]:
             ax.axvline(j["x_nm"], color="k", lw=0.6)
@@ -125,7 +125,7 @@ def plot_efield_2d(model, fields, n_arrows_across_dep: int = 6,
     fig, ax = plt.subplots(figsize=(5, 8))
     im = ax.imshow(fields["E_Vcm"] / 1e3, extent=model.extent_nm,
                     cmap="magma")
-    plt.colorbar(im, ax=ax, label="|E| (kV/cm)")
+    plt.colorbar(im, ax=ax, label="|E_bi| (kV/cm)")
 
     Ex = fields["Ex"]; Ey = fields["Ey"]
     dep = fields["dep_mask"]
@@ -160,7 +160,7 @@ def plot_efield_2d(model, fields, n_arrows_across_dep: int = 6,
             ax.axvline(j["pos"], color="white", lw=0.6, alpha=0.6)
         else:
             ax.axhline(j["pos"], color="white", lw=0.6, alpha=0.6)
-    ax.set_title("Electric field (|E| + direction)")
+    ax.set_title("Built-in electric field  |E_bi| + direction")
     ax.set_xlabel("x (nm)"); ax.set_ylabel("y (nm)")
     fig.tight_layout()
     return fig
@@ -178,7 +178,7 @@ def plot_efield_streamlines(model, fields):
     strm = ax.streamplot(x, y, fields["Ex"], fields["Ey"],
                           color=fields["E_Vcm"] / 1e3,
                           cmap="magma", density=1.2, linewidth=1.0)
-    plt.colorbar(strm.lines, ax=ax, label="|E| (kV/cm)")
+    plt.colorbar(strm.lines, ax=ax, label="|E_bi| (kV/cm)")
     ax.set_xlim(0, W * px); ax.set_ylim(H * px, 0)
     ax.set_title("Electric field streamlines")
     ax.set_xlabel("x (nm)"); ax.set_ylabel("y (nm)")
