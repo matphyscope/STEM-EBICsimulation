@@ -162,12 +162,11 @@ def electric_field_1d(sl: Slice1D, depletion: dict) -> dict:
     rho = np.zeros_like(sl.Nnet)
     in_dep = np.zeros_like(sl.Nnet, dtype=bool)
     for j in depletion["junctions"]:
-        idx = j["index"]
-        xj = x[idx]
+        xj = j["x_nm"] * 1e-7        # midpoint of the metallurgical junction
         wl = j["w_left_nm"] * 1e-7
         wr = j["w_right_nm"] * 1e-7
-        left  = (x >= xj - wl) & (x <= xj)
-        right = (x >= xj) & (x <= xj + wr)
+        left  = (x >= xj - wl) & (x <  xj)
+        right = (x >= xj)      & (x <= xj + wr)
         rho[left]  += j["left_sign"]  * C.q * j["N_left"]
         rho[right] += j["right_sign"] * C.q * j["N_right"]
         in_dep |= left | right

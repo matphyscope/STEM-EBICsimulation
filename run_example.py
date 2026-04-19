@@ -27,29 +27,28 @@ os.makedirs(OUT, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# 1. Image -> model.  The scale bar is now embedded in image.png so we
-#    detect it from the same file.
+# 1. Image -> model (OpenCV-driven).
+#    The scale bar is auto-detected in the bottom-left corner; every
+#    coloured shape is segmented with K-means + cv2.findContours and
+#    numbered top-to-bottom (axis='y') so the top stripe is region 1,
+#    middle is 2, bottom is 3.
 # ---------------------------------------------------------------------------
 model = image_model.build_model(
     image_path=os.path.join(HERE, "image.png"),
-    n_clusters=1,                     # regions are assigned manually
+    n_clusters=3,                 # three coloured stripes in this sample
     thickness_nm=100.0,
     bar_length_um=10.0,
+    auto_number_by="y",
 )
 print(f"nm / pixel = {model.nm_per_pixel:.3f}")
+print(f"scale bar  : {model.scalebar['length_px']} px -> "
+      f"{10.0} um,   at y={model.scalebar['y']}  "
+      f"x={model.scalebar['x0']}..{model.scalebar['x1']}")
 print(f"image size : {model.shape} pixels  ->  "
       f"{model.shape[1]*model.nm_per_pixel/1000:.1f} x "
       f"{model.shape[0]*model.nm_per_pixel/1000:.1f} um")
-
-
-# ---------------------------------------------------------------------------
-# 2. Region numbering by colour: top yellow, middle blue, bottom orange.
-# ---------------------------------------------------------------------------
-model.clear_regions()
-model.add_region_from_color(1, rgb=(245, 190,  40))   # yellow top    -> Pt
-model.add_region_from_color(2, rgb=( 70, 115, 200))   # blue middle   -> SIMS
-model.add_region_from_color(3, rgb=(230, 130,  40))   # orange bottom -> W
-print(f"regions found: {model.region_ids()}")
+print(f"shapes     : {len(model.contours)} contours,  "
+      f"regions = {model.region_ids()}")
 
 
 # ---------------------------------------------------------------------------
@@ -70,23 +69,31 @@ print("Materials loaded:", list(mat_table.keys()))
 p_prof = sims.load_profile(os.path.join(HERE, "SIMSPdata.csv"), kind="P")
 n_prof = sims.load_profile(os.path.join(HERE, "SIMSNdata.csv"), kind="N")
 
-# The CSV column headers are "Y" (depth along y, in nm) and
-# "Z" (concentration).  That means the SIMS depth axis is +y in the
-# structure.  The user-specified active area is
-#     x in [10, 110] um  (transverse)
-#     y in [0, 500] um   (depth direction)
-# The surface (depth = 0) sits at y = 0.
+# The SIMS CSVs store depth on the Y axis (nm) and concentration on Z
+# (cm^-3), so depth grows in +y here.  The user-settable placement is
+#     x in [10, 110] um   (transverse, pixels outside this band are
+#                          untouched)
+#     y in [0, 500] um    (depth direction, starting at the surface)
+# The "surface" (depth = 0) is placed at the top of the SIMS region
+# - that is, at the Pt / Si interface - so depth = 0 coincides with
+# the physical surface of the semiconductor.  The user can override
+# SIMS_SURFACE_Y_NM explicitly if a different reference is desired.
 SIMS_X_RANGE_NM = (10_000.0, 110_000.0)
 SIMS_Y_RANGE_NM = (     0.0, 500_000.0)
 
+sims_bbox = model.region_bbox_nm(2)          # (x_lo, x_hi, y_lo, y_hi)
+SIMS_SURFACE_Y_NM = float(sims_bbox[2]) if sims_bbox else 0.0
+print(f"SIMS surface placed at y = {SIMS_SURFACE_Y_NM:.0f} nm "
+      f"(top of region #2).  depth = y - surface")
+
 placement_P = sims.ProfilePlacement(
     p_prof, axis="y",
-    pos_nm=SIMS_Y_RANGE_NM[0],       # surface sits at y = 0
-    range_nm=SIMS_X_RANGE_NM,        # transverse range on the OTHER axis
+    pos_nm=SIMS_SURFACE_Y_NM,
+    range_nm=SIMS_X_RANGE_NM,
     direction="+y",
 )
 placement_N = sims.ProfilePlacement(
-    n_prof, axis="y", pos_nm=SIMS_Y_RANGE_NM[0],
+    n_prof, axis="y", pos_nm=SIMS_SURFACE_Y_NM,
     range_nm=SIMS_X_RANGE_NM, direction="+y",
 )
 

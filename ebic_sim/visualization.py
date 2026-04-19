@@ -31,10 +31,27 @@ def plot_regions(model):
                     vmin=0, vmax=9)
     ax.set_title("User-assigned regions")
     ax.set_xlabel("x (nm)"); ax.set_ylabel("y (nm)")
-    # annotate each region with its id + material at the centre of its bbox
+    # annotate each region with its id + material at its largest-contour
+    # centroid (robust against stray dust pixels)
+    p = model.nm_per_pixel
+    best = getattr(model, "largest_contour_per_cluster", lambda: {})()
+    # map cluster -> region via current region_mask value
+    for cid, (_cnt, _area, cx, cy) in best.items():
+        # find rid by looking up the region_mask value at that centroid
+        rid = int(model.region_mask[int(cy), int(cx)])
+        if rid == 0:
+            continue
+        mat = model.materials.get(rid, "?")
+        ax.text(cx * p, cy * p, f"#{rid}  {mat}", ha="center", va="center",
+                 color="white", fontweight="bold")
+    # fallback for regions added via bbox/color (no contour record)
     for rid in model.region_ids():
+        if any(int(model.region_mask[int(cy), int(cx)]) == rid
+                for _cid, (_c, _a, cx, cy) in best.items()):
+            continue
         ys, xs = np.where(model.region_mask == rid)
-        p = model.nm_per_pixel
+        if not xs.size:
+            continue
         cy = 0.5 * (ys.min() + ys.max()) * p
         cx = 0.5 * (xs.min() + xs.max()) * p
         mat = model.materials.get(rid, "?")
